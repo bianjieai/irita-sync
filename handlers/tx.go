@@ -2,19 +2,48 @@ package handlers
 
 import (
 	"context"
-	"github.com/bianjieai/irita-sync/libs/cdc"
+	"github.com/bianjieai/irita-sync/config"
 	"github.com/bianjieai/irita-sync/libs/logger"
+	"github.com/bianjieai/irita-sync/libs/msgparser"
 	"github.com/bianjieai/irita-sync/libs/pool"
 	"github.com/bianjieai/irita-sync/models"
 	"github.com/bianjieai/irita-sync/utils"
 	"github.com/bianjieai/irita-sync/utils/constant"
-	"github.com/cosmos/cosmos-sdk/x/auth/signing"
+	"github.com/kaifei-bianjie/msg-parser/codec"
+	msgtypes "github.com/kaifei-bianjie/msg-parser/types"
 	aTypes "github.com/tendermint/tendermint/abci/types"
 	ctypes "github.com/tendermint/tendermint/rpc/core/types"
 	"github.com/tendermint/tendermint/types"
 	"gopkg.in/mgo.v2/txn"
+	"strings"
 	"time"
 )
+
+var _parser msgparser.MsgParser
+
+func InitRouter(conf *config.Config) {
+	initBech32Prefix(conf)
+	router := msgparser.RegisteRouter()
+	if conf.Server.OnlySupportModule != "" {
+		modules := strings.Split(conf.Server.OnlySupportModule, ",")
+		msgRoute := msgparser.NewRouter()
+		for _, one := range modules {
+			fn, exist := msgparser.RouteHandlerMap[one]
+			if !exist {
+				logger.Fatal("no support module: " + one)
+			}
+			msgRoute = msgRoute.AddRoute(one, fn)
+			if one == msgparser.IbcRouteKey {
+				msgRoute = msgRoute.AddRoute(msgparser.IbcTransferRouteKey, msgparser.RouteHandlerMap[one])
+			}
+		}
+		if msgRoute.GetRoutesLen() > 0 {
+			router = msgRoute
+		}
+
+	}
+	_parser = msgparser.NewMsgParser(router)
+}
 
 func ParseBlockAndTxs(b int64, client *pool.Client) (*models.Block, []*models.Tx, []txn.Op, error) {
 	var (
@@ -64,14 +93,14 @@ func ParseBlockAndTxs(b int64, client *pool.Client) (*models.Block, []*models.Tx
 func parseTx(c *pool.Client, txBytes types.Tx, block *types.Block) (models.Tx, []txn.Op, error) {
 	var (
 		docTx     models.Tx
-		docTxMsgs []models.DocTxMsg
+		docTxMsgs []msgtypes.TxMsg
 		txnOps    []txn.Op
 		log       string
 	)
 
 	txHash := utils.BuildHex(txBytes.Hash())
 	height := block.Height
-	Tx, err := cdc.GetTxDecoder()(txBytes)
+	authTx, err := codec.GetSigningTx(txBytes)
 	if err != nil {
 		logger.Warn(err.Error(),
 			logger.String("errTag", "TxDecoder"),
@@ -79,9 +108,7 @@ func parseTx(c *pool.Client, txBytes types.Tx, block *types.Block) (models.Tx, [
 			logger.Int64("height", height))
 		return docTx, txnOps, nil
 	}
-
-	authTx := Tx.(signing.Tx)
-	fee := models.BuildFee(authTx.GetFee(), authTx.GetGas())
+	fee := msgtypes.BuildFee(authTx.GetFee(), authTx.GetGas())
 	memo := authTx.GetMemo()
 	ctx := context.Background()
 	txResult, err := c.Tx(ctx, txBytes.Hash(), false)
@@ -102,7 +129,7 @@ func parseTx(c *pool.Client, txBytes types.Tx, block *types.Block) (models.Tx, [
 		Height:  height,
 		Time:    block.Time.Unix(),
 		TxHash:  txHash,
-		Fee:     &fee,
+		Fee:     fee,
 		Memo:    memo,
 		Status:  status,
 		Log:     log,
@@ -115,7 +142,7 @@ func parseTx(c *pool.Client, txBytes types.Tx, block *types.Block) (models.Tx, [
 	}
 
 	for i, v := range msgs {
-		msgDocInfo, ops := HandleTxMsg(v)
+		msgDocInfo, ops := _parser.HandleTxMsg(v)
 		if len(msgDocInfo.Addrs) == 0 {
 			continue
 		}
@@ -180,4 +207,18 @@ func parseEvents(events []aTypes.Event) []models.Event {
 	}
 
 	return eventDocs
+}
+
+func removeDuplicatesFromSlice(data []string) (result []string) {
+	tempSet := make(map[string]string, len(data))
+	for _, val := range data {
+		if _, ok := tempSet[val]; ok || val == "" {
+			continue
+		}
+		tempSet[val] = val
+	}
+	for one := range tempSet {
+		result = append(result, one)
+	}
+	return
 }
